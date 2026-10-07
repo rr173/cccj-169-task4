@@ -97,6 +97,10 @@ def new_report_id(conn: sqlite3.Connection) -> str:
     return f"REP-{_day_seq(conn, 'report')}"
 
 
+def new_seal_id(conn: sqlite3.Connection) -> str:
+    return f"SEA-{_day_seq(conn, 'seal')}"
+
+
 def log_event(conn: sqlite3.Connection, device_id: str | None,
               event_type: str, detail: dict | None = None) -> None:
     conn.execute(

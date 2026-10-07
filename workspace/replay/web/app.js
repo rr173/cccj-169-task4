@@ -9,6 +9,7 @@ const state = {
   timeline: null,      // 当前选中版本的校正事件
   replayIdx: 0,
   lastReport: null,
+  pendingSealDownload: null,  // 刚发放、待一次性下载的封存包 {sealId, token}
 };
 
 /* ------------------------------------------------------------------ */
@@ -59,6 +60,7 @@ function refreshTab(tab) {
   if (tab === "timeline") loadVersions();
   if (tab === "review") loadFindings();
   if (tab === "reports") loadReportVersions();
+  if (tab === "seals") loadSeals();
 }
 
 /* ------------------------------------------------------------------ */
@@ -532,6 +534,98 @@ $("#verify-report").addEventListener("click", async () => {
   } catch (e) {
     box.className = "notice bad";
     box.textContent = `拒绝加载：${e.message}`;
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* 一次性事件封存包                                                      */
+/* ------------------------------------------------------------------ */
+async function loadSeals() {
+  if (!state.deviceId) return;
+  const [{ versions }, { findings }, { seals }] = await Promise.all([
+    api("GET", `/api/devices/${state.deviceId}/versions`),
+    api("GET", `/api/findings?device_id=${state.deviceId}`),
+    api("GET", `/api/seals?device_id=${state.deviceId}`),
+  ]);
+  // 按版本聚合待复核数，用于在选项里提示能否封存
+  const pendingByVersion = {};
+  for (const f of findings) {
+    pendingByVersion[f.version_id] = (pendingByVersion[f.version_id] || 0)
+      + (f.status === "pending" ? 1 : 0);
+  }
+  const sealedVersions = new Set(seals.map((s) => s.version_id));
+  const sel = $("#seal-version");
+  sel.innerHTML = versions.map((v) => {
+    const pending = pendingByVersion[v.version_id] || 0;
+    let hint = v.status;
+    if (sealedVersions.has(v.version_id)) hint = "已封存";
+    else if (pending > 0) hint = `${pending} 项待复核`;
+    else if (v.status !== "active") hint = v.status;
+    else hint = "可封存";
+    return `<option value="${esc(v.version_id)}">${esc(v.version_id)}`
+      + `（${hint}）</option>`;
+  }).join("");
+  const tbody = $("#seal-table tbody");
+  tbody.innerHTML = seals.map((s) => `
+    <tr>
+      <td>${esc(s.seal_id)}</td><td>${esc(s.device_id)}</td>
+      <td>${esc(s.version_id)}</td><td>${s.event_count}</td>
+      <td>${s.review_total}</td>
+      <td><span class="badge ${s.status}">${s.status}</span></td>
+      <td>${esc(s.issued_by || "-")}</td>
+      <td>${s.downloaded_at ? fmtTime(s.downloaded_at) : "—"}</td>
+    </tr>`).join("");
+}
+
+$("#issue-seal").addEventListener("click", async () => {
+  const versionId = $("#seal-version").value;
+  if (!versionId) return alert("没有可封存的版本");
+  const box = $("#seal-issued");
+  try {
+    const r = await api("POST", "/api/seals/issue", {
+      device_id: state.deviceId, version_id: versionId,
+      issued_by: $("#reviewer").value.trim() || "操作员",
+    });
+    state.pendingSealDownload = { sealId: r.seal_id, token: r.download_token };
+    box.className = "notice ok";
+    box.textContent =
+      `封存包 ${r.seal_id} 已发放（事件 ${r.event_count}，复核 ${r.review_total}）。\n`
+      + "一次性下载令牌仅显示这一次（请立即下载，离开后无法找回）：\n"
+      + r.download_token;
+    $("#download-seal").classList.remove("hidden");
+    loadSeals();
+  } catch (e) {
+    box.className = "notice bad";
+    box.textContent = `发放失败：${e.message}`;
+  }
+});
+
+$("#download-seal").addEventListener("click", async () => {
+  const pend = state.pendingSealDownload;
+  if (!pend) return;
+  const box = $("#seal-issued");
+  try {
+    const r = await api("POST",
+      `/api/seals/${pend.sealId}/download`,
+      { download_token: pend.token });
+    const blob = new Blob([JSON.stringify(r.envelope, null, 2)],
+                          { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `${pend.sealId}.json`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    state.pendingSealDownload = null;
+    $("#download-seal").classList.add("hidden");
+    box.className = "notice ok";
+    box.textContent = `封存包 ${pend.sealId} 已下载，令牌已作废。`
+      + "请使用 python3 -m app.sealctl 在离线环境核对。";
+    loadSeals();
+  } catch (e) {
+    box.className = "notice bad";
+    box.textContent = `下载失败：${e.message}`;
+    state.pendingSealDownload = null;
+    $("#download-seal").classList.add("hidden");
   }
 });
 

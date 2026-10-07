@@ -19,13 +19,14 @@ Invariants enforced:
 from __future__ import annotations
 
 import json
+import secrets
 import sqlite3
 
-from . import detect
+from . import detect, seal
 from .clock import correct, fit_clock
 from .core import (ApiError, canonical, log_event, new_batch_id,
                    new_device_id, new_device_secret, new_finding_id,
-                   new_report_id, new_version_id, sha256_text,
+                   new_report_id, new_seal_id, new_version_id, sha256_text,
                    sign_device_payload, verify_device_payload)
 from .db import now_iso
 
@@ -623,3 +624,208 @@ def verify_report(conn: sqlite3.Connection, body: dict) -> dict:
     return {"ok": True, "report_id": payload.get("report_id"),
             "version_id": payload.get("version_id"),
             "finding_count": len(payload.get("findings") or [])}
+
+
+# ---------------------------------------------------------------------------
+# 一次性事件封存包：复核闭环后发放，一次性令牌下载，离线命令行核对
+# ---------------------------------------------------------------------------
+
+def _seal_payloads(conn: sqlite3.Connection, dev: sqlite3.Row,
+                   ver: sqlite3.Row) -> tuple[list[dict], list[dict]]:
+    events = [dict(r) for r in conn.execute(
+        "SELECT c.event_uid, c.kind, c.value, c.device_ts, c.corrected_ts,"
+        "       r.device_seq, r.batch_id "
+        "FROM corrected_events c "
+        "JOIN raw_events r ON r.device_id = c.device_id "
+        "                 AND r.event_uid = c.event_uid "
+        "WHERE c.version_id = ? "
+        "ORDER BY c.corrected_ts, c.event_uid",
+        (ver["version_id"],)).fetchall()]
+    findings = [_finding_view(r) for r in conn.execute(
+        "SELECT * FROM findings WHERE version_id = ? ORDER BY finding_id",
+        (ver["version_id"],)).fetchall()]
+    return events, findings
+
+
+def issue_sealed_package(conn: sqlite3.Connection, body: dict) -> dict:
+    """风险复核闭环后，对（设备 × 时间线版本）封存一次性事件包。
+
+    闸门：
+
+    * 版本必须属于指定设备（``422 version_device_mismatch``）；
+    * 版本必须仍是当前有效版本 active —— 被新版本取代的版本
+      （superseded）封存会“引用已失效版本”，``409 seal_version_stale``；
+    * 该版本的复核项必须全部闭环（无 pending），否则
+      ``409 review_not_closed``；
+    * 同一 (device_id, version_id) 只封存一次，重复发放
+      ``409 seal_already_issued``（请用列表接口取回既有发放记录；
+      封存包本身仍只能凭一次性令牌下载一次）。
+
+    返回内容含**只出现一次**的 download_token：随后凭令牌 POST
+    /api/seals/{id}/download 换取封存包，令牌用后即焚。
+    """
+    device_id = _str(body.get("device_id"), "device_id")
+    version_id = _str(body.get("version_id"), "version_id")
+    issued_by = _str(body.get("issued_by") or body.get("reviewer")
+                     or "操作员", "issued_by", allow_empty=True)
+    _begin(conn)
+    try:
+        dev = _get_device(conn, device_id)
+        ver = _get_version(conn, version_id)
+        if ver["device_id"] != device_id:
+            raise ApiError(422, "version_device_mismatch",
+                           f"版本 {version_id} 不属于设备 {device_id}")
+        # 同 (设备 × 版本) 重复封存最先识别：封存后版本是 sealed 终态，
+        # 不先查重会被下面的状态闸门误报为 seal_version_stale。
+        existing = conn.execute(
+            "SELECT seal_id, status, created_at, downloaded_at "
+            "FROM sealed_packages WHERE device_id = ? AND version_id = ?",
+            (device_id, version_id)).fetchone()
+        if existing:
+            raise ApiError(
+                409, "seal_already_issued",
+                f"设备 {device_id} 的版本 {version_id} 已封存为 "
+                f"{existing['seal_id']}（{existing['status']}）；"
+                "封存包一次性下载，令牌不补发")
+        if ver["status"] != "active":
+            raise ApiError(
+                409, "seal_version_stale",
+                f"版本 {version_id} 已失效（{ver['status']}），"
+                "不能封存引用旧版本的封存包；请先重建并复核最新版本")
+        pending = conn.execute(
+            "SELECT COUNT(*) AS c FROM findings "
+            "WHERE version_id = ? AND status = 'pending'",
+            (version_id,)).fetchone()["c"]
+        if pending:
+            raise ApiError(
+                409, "review_not_closed",
+                f"版本 {version_id} 还有 {pending} 项待复核，"
+                "全部闭环后才能封存")
+        events, findings = _seal_payloads(conn, dev, ver)
+        seal_id = new_seal_id(conn)
+        ts = now_iso()
+        # 封存即终态：版本翻成 sealed，之后重建时间线只取代 active 版本，
+        # 封存引用的版本内容与状态永久冻结（触发器再兜底不可改/删）。
+        sealed_ver = dict(ver)
+        sealed_ver["status"] = "sealed"
+        manifest = seal.build_manifest(
+            seal_id=seal_id, sealed_at=ts,
+            device={"device_id": dev["device_id"], "name": dev["name"]},
+            version=sealed_ver, events=events, findings=findings)
+        envelope = seal.seal_envelope(dev["secret_key"], manifest)
+        token = secrets.token_urlsafe(32)
+        conn.execute(
+            "UPDATE timeline_versions SET status = 'sealed' "
+            "WHERE version_id = ? AND status = 'active'",
+            (version_id,))
+        try:
+            conn.execute(
+                "INSERT INTO sealed_packages(seal_id, device_id, version_id,"
+                " envelope, event_count, review_total, download_token,"
+                " issued_by, status, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?, 'ready', ?)",
+                (seal_id, device_id, version_id, canonical(envelope),
+                 len(events), len(findings), token, issued_by, ts))
+        except sqlite3.IntegrityError as e:
+            # 并发封存：两个事务都通过了上面的查重，UNIQUE(device_id,
+            # version_id) 在此裁决——只允许一个成功
+            if "sealed_packages.device_id,sealed_packages.version_id" in str(e) \
+                    or "UNIQUE" in str(e).upper():
+                raise ApiError(
+                    409, "seal_already_issued",
+                    f"设备 {device_id} 的版本 {version_id} 已被并发封存") from e
+            raise
+        log_event(conn, device_id, "seal_issued",
+                  {"seal_id": seal_id, "version_id": version_id,
+                   "events": len(events), "findings": len(findings),
+                   "issued_by": issued_by})
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    return {"seal_id": seal_id, "device_id": device_id,
+            "version_id": version_id, "status": "ready",
+            "event_count": len(events), "review_total": len(findings),
+            "download_token": token, "issued_by": issued_by,
+            "created_at": ts,
+            "download_hint":
+                "download_token 仅显示一次：POST /api/seals/"
+                f"{seal_id}/download 携带 {json.dumps({'download_token': '…'})} "
+                "换取封存包；下载成功后令牌立即失效"}
+
+
+def download_sealed_package(conn: sqlite3.Connection, seal_id: str,
+                            body: dict) -> dict:
+    """凭一次性令牌下载封存包。
+
+    * 封存包不存在 → 404 seal_not_found；
+    * 令牌错误 → 403 seal_token_invalid（已下载的包令牌同样失效）；
+    * 版本状态不是 sealed（封存引用被破坏，双保险）
+      → 409 seal_version_stale。
+
+    下载成功是 CAS：``UPDATE … WHERE status='ready'``，并发抢令牌
+    只有一个成功；行一旦翻成 downloaded，download_token 立即作废。
+    """
+    token = body.get("download_token")
+    if not isinstance(token, str) or not token:
+        raise ApiError(422, "invalid_token", "download_token 必须是非空字符串")
+    _begin(conn)
+    try:
+        row = conn.execute(
+            "SELECT * FROM sealed_packages WHERE seal_id = ?",
+            (seal_id,)).fetchone()
+        if not row:
+            raise ApiError(404, "seal_not_found",
+                           f"封存包 {seal_id} 不存在")
+        if not secrets.compare_digest(row["download_token"], token):
+            raise ApiError(403, "seal_token_invalid",
+                           "下载令牌无效或已被使用（封存包一次性下载）")
+        if row["status"] != "ready":
+            raise ApiError(403, "seal_already_downloaded",
+                           f"封存包 {seal_id} 已下载，令牌已失效，"
+                           "不能重复下载；如需重新封存请使用新版本")
+        ver = conn.execute(
+            "SELECT status FROM timeline_versions WHERE version_id = ?",
+            (row["version_id"],)).fetchone()
+        if ver is None or ver["status"] != "sealed":
+            raise ApiError(
+                409, "seal_version_stale",
+                f"封存包 {seal_id} 引用的版本 {row['version_id']} "
+                f"状态为 {ver['status'] if ver else 'missing'}（非 sealed），"
+                "引用已失效，拒绝下载")
+        ts = now_iso()
+        cur = conn.execute(
+            "UPDATE sealed_packages SET status = 'downloaded', "
+            "downloaded_at = ? WHERE seal_id = ? AND status = 'ready'",
+            (ts, seal_id))
+        if cur.rowcount == 0:  # 并发下载：只有一个能赢
+            raise ApiError(403, "seal_already_downloaded",
+                           "封存包已被另一请求下载，令牌已失效")
+        # 令牌用后即焚：返回的封存包不再包含可再次使用的服务端令牌
+        envelope = json.loads(row["envelope"])
+        conn.execute(
+            "UPDATE sealed_packages SET download_token = ? WHERE seal_id = ?",
+            (secrets.token_urlsafe(32), seal_id))
+        log_event(conn, row["device_id"], "seal_downloaded",
+                  {"seal_id": seal_id, "version_id": row["version_id"]})
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    return {"seal_id": seal_id, "device_id": row["device_id"],
+            "version_id": row["version_id"], "downloaded_at": ts,
+            "envelope": envelope}
+
+
+def list_sealed_packages(conn: sqlite3.Connection,
+                         device_id: str | None = None) -> list[dict]:
+    """封存发放台账（不含封存包内容与令牌——令牌只在发放时出现一次）。"""
+    sql = ("SELECT seal_id, device_id, version_id, event_count,"
+           " review_total, status, issued_by, created_at, downloaded_at "
+           "FROM sealed_packages")
+    args: list = []
+    if device_id:
+        sql += " WHERE device_id = ?"
+        args.append(device_id)
+    sql += " ORDER BY created_at DESC, seal_id DESC"
+    return [dict(r) for r in conn.execute(sql, args).fetchall()]

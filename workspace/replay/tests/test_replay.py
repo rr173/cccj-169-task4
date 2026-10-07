@@ -5,6 +5,7 @@ Run:  python3 -m unittest tests.test_replay -v
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
@@ -13,7 +14,7 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app import guards  # noqa: E402
+from app import guards, seal as sealmod  # noqa: E402
 from app import db as dbmod  # noqa: E402
 from app.clock import fit_clock  # noqa: E402
 from app.core import ApiError, canonical, sha256_text  # noqa: E402
@@ -81,7 +82,10 @@ class ReplayTest(unittest.TestCase):
         os.close(fd)
         os.remove(self.path)
         dbmod.DB_PATH = self.path
-        self.conn = dbmod.connect()
+        self.conn = sqlite3.connect(
+            self.path, timeout=30, isolation_level=None,
+            check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
         dbmod.init_db(self.conn)
         self.dev = guards.create_device(self.conn, {"name": "挤出机-A"})
 
@@ -525,6 +529,377 @@ class ReplayTest(unittest.TestCase):
                 "device_id": other["device_id"], "report": report})
         self.assertEqual(cm.exception.error, "signature_mismatch")
 
+    # -- 一次性事件封存包 ---------------------------------------------------
+    def _close_all_findings(self, device_id, action="accept"):
+        pending = guards.list_findings(self.conn, device_id=device_id,
+                                       status="pending")
+        for f in pending:
+            guards.review_finding(self.conn, f["finding_id"], {
+                "action": action, "reviewer": "张三",
+                "review_seq": f["review_seq"]})
+
+    def _reviewed_version(self):
+        """上传 → 重建 → 全部复核闭环；返回 (device, version_id)。"""
+        r = self.build_with_anomalies()
+        self._close_all_findings(self.dev["device_id"])
+        return r["version_id"]
+
+    def test_18_seal_requires_all_findings_closed(self):
+        r = self.build_with_anomalies()
+        with self.assertRaises(ApiError) as cm:
+            guards.issue_sealed_package(self.conn, {
+                "device_id": self.dev["device_id"],
+                "version_id": r["version_id"]})
+        self.assertEqual(cm.exception.status, 409)
+        self.assertEqual(cm.exception.error, "review_not_closed")
+
+    def test_19_seal_rejects_superseded_version(self):
+        r = self.build_with_anomalies()
+        self._close_all_findings(self.dev["device_id"])
+        guards.build_timeline(self.conn, self.dev["device_id"])  # 旧版翻 superseded
+        with self.assertRaises(ApiError) as cm:
+            guards.issue_sealed_package(self.conn, {
+                "device_id": self.dev["device_id"],
+                "version_id": r["version_id"]})
+        self.assertEqual(cm.exception.error, "seal_version_stale")
+
+    def test_20_seal_issue_download_onetime_roundtrip(self):
+        vid = self._reviewed_version()
+        issued = guards.issue_sealed_package(self.conn, {
+            "device_id": self.dev["device_id"], "version_id": vid,
+            "issued_by": "李四"})
+        self.assertTrue(issued["download_token"])
+        self.assertEqual(issued["status"], "ready")
+        seal_id = issued["seal_id"]
+        token = issued["download_token"]
+        # 同 (设备×版本) 只能封存一次
+        with self.assertRaises(ApiError) as cm:
+            guards.issue_sealed_package(self.conn, {
+                "device_id": self.dev["device_id"], "version_id": vid})
+        self.assertEqual(cm.exception.error, "seal_already_issued")
+        # 错令牌拒绝
+        with self.assertRaises(ApiError) as cm:
+            guards.download_sealed_package(
+                self.conn, seal_id, {"download_token": "wrong"})
+        self.assertEqual(cm.exception.error, "seal_token_invalid")
+        # 正确令牌：一次性下载成功
+        got = guards.download_sealed_package(
+            self.conn, seal_id, {"download_token": token})
+        envelope = got["envelope"]
+        self.assertEqual(envelope["format"], "replay-seal/v1")
+        self.assertEqual(envelope["device_id"], self.dev["device_id"])
+        self.assertEqual(envelope["manifest"]["version"]["version_id"], vid)
+        self.assertEqual(envelope["manifest"]["version"]["status"], "sealed")
+        self.assertGreater(envelope["manifest"]["event_count"], 0)
+        self.assertEqual(
+            envelope["manifest"]["review_summary"]["pending"], 0)
+        # 版本进入 sealed 终态；之后重建时间线不能把它翻掉
+        guards.build_timeline(self.conn, self.dev["device_id"])
+        v = next(v for v in guards.list_versions(
+            self.conn, self.dev["device_id"]) if v["version_id"] == vid)
+        self.assertEqual(v["status"], "sealed")
+        # 原令牌立即失效，重复下载拒绝
+        with self.assertRaises(ApiError) as cm:
+            guards.download_sealed_package(
+                self.conn, seal_id, {"download_token": token})
+        self.assertEqual(cm.exception.error, "seal_token_invalid")
+        # 台账标记 downloaded
+        seals = guards.list_sealed_packages(
+            self.conn, device_id=self.dev["device_id"])
+        self.assertEqual(seals[0]["seal_id"], seal_id)
+        self.assertEqual(seals[0]["status"], "downloaded")
+        self.assertIsNotNone(seals[0]["downloaded_at"])
+
+    def test_21_sealed_version_is_immutable(self):
+        vid = self._reviewed_version()
+        issued = guards.issue_sealed_package(self.conn, {
+            "device_id": self.dev["device_id"], "version_id": vid})
+        guards.download_sealed_package(
+            self.conn, issued["seal_id"],
+            {"download_token": issued["download_token"]})
+        # 封存包也是版本引用：触发器继续兜底禁止改/删
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute(
+                "UPDATE corrected_events SET corrected_ts = 0 "
+                "WHERE version_id = ?", (vid,))
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute(
+                "DELETE FROM timeline_versions WHERE version_id = ?", (vid,))
+
+    def test_22b_concurrent_seal_only_one_wins(self):
+        vid = self._reviewed_version()
+        results, errors = [], []
+        # sqlite3 连接默认不能跨线程；用两个独立连接并发封存
+        conn2 = sqlite3.connect(
+            self.path, timeout=30, isolation_level=None,
+            check_same_thread=False)
+        conn2.row_factory = sqlite3.Row
+        conn2.execute("PRAGMA busy_timeout = 30000")
+        dbmod.init_db(conn2)
+        barrier = threading.Barrier(2)
+
+        def w1():
+            barrier.wait()
+            try:
+                results.append(guards.issue_sealed_package(self.conn, {
+                    "device_id": self.dev["device_id"],
+                    "version_id": vid}))
+            except ApiError as e:
+                errors.append((e.status, e.error))
+
+        def w2():
+            barrier.wait()
+            try:
+                results.append(guards.issue_sealed_package(conn2, {
+                    "device_id": self.dev["device_id"],
+                    "version_id": vid}))
+            except ApiError as e:
+                errors.append((e.status, e.error))
+
+        t1, t2 = threading.Thread(target=w1), threading.Thread(target=w2)
+        t1.start(); t2.start(); t1.join(); t2.join()
+        conn2.close()
+        self.assertEqual(len(results), 1)        # 只有一个封存成功
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0][0], 409)
+        self.assertEqual(errors[0][1], "seal_already_issued")
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) c FROM sealed_packages "
+            "WHERE version_id = ?", (vid,)).fetchone()["c"], 1)
+
+    def test_22_seal_envelope_verifies_and_detects_tampering_inproc(self):
+        vid = self._reviewed_version()
+        issued = guards.issue_sealed_package(self.conn, {
+            "device_id": self.dev["device_id"], "version_id": vid})
+        got = guards.download_sealed_package(
+            self.conn, issued["seal_id"],
+            {"download_token": issued["download_token"]})
+        env = got["envelope"]
+        secret = self.dev["secret_key"]
+        # 原封不动：结构 + 设备 + 完整性证明全部通过
+        parsed = sealmod.parse_envelope(json.loads(json.dumps(env)))
+        sealmod.check_identity(parsed, self.dev["device_id"])
+        manifest = sealmod.verify_integrity(parsed, secret)
+        self.assertEqual(manifest["event_count"], len(manifest["events"]))
+        # 改事件数量 → 篡改
+        bad = json.loads(json.dumps(env))
+        bad["manifest"]["event_count"] = 1
+        with self.assertRaises(sealmod.SealError) as cm:
+            sealmod.verify_integrity(sealmod.parse_envelope(bad), secret)
+        self.assertEqual(cm.exception.code, "seal_tampered")
+        # 改一条事件的值 → 指纹不符
+        bad = json.loads(json.dumps(env))
+        bad["manifest"]["events"][0]["value"] = 999.0
+        with self.assertRaises(sealmod.SealError) as cm:
+            sealmod.verify_integrity(sealmod.parse_envelope(bad), secret)
+        self.assertEqual(cm.exception.code, "seal_tampered")
+        # 换设备身份
+        with self.assertRaises(sealmod.SealError) as cm:
+            sealmod.check_identity(
+                sealmod.parse_envelope(json.loads(json.dumps(env))),
+                "DEV-OTHER")
+        self.assertEqual(cm.exception.code, "seal_cross_device")
+        # 损坏结构
+        with self.assertRaises(sealmod.SealError) as cm:
+            sealmod.parse_envelope({"format": "weird"})
+        self.assertEqual(cm.exception.code, "seal_malformed")
+
+
+class SealCliTest(unittest.TestCase):
+    """离线命令行核对工具（python3 -m app.sealctl）。
+
+    子进程在隔离的临时 HOME/cwd 中运行，只拿到封存包文件与设备密钥，
+    不启动服务进程、不指向数据库——验证封存包可离线核对，且四类拒绝
+    （篡改 / 换设备 / 重复导入 / 失效版本）退出码与错误码可区分。
+    """
+
+    REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    @classmethod
+    def setUpClass(cls):
+        fd, cls.db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        os.remove(cls.db_path)
+        dbmod.DB_PATH = cls.db_path
+        conn = dbmod.connect()
+        dbmod.init_db(conn)
+        cls.dev = guards.create_device(conn, {"name": "CLI-挤出机"})
+        events = make_events()
+        chunks = [events[i:i + 50] for i in range(0, len(events), 50)]
+        batch = guards.create_batch(conn, {
+            "device_id": cls.dev["device_id"],
+            "package_hash": package_hash(events),
+            "total_chunks": len(chunks)})
+        for i, c in enumerate(chunks):
+            guards.put_chunk(conn, batch["batch_id"], i, {"events": c})
+        guards.commit_batch(conn, batch["batch_id"])
+        cls.built = guards.build_timeline(conn, cls.dev["device_id"])
+        for f in guards.list_findings(
+                conn, device_id=cls.dev["device_id"], status="pending"):
+            guards.review_finding(conn, f["finding_id"], {
+                "action": "accept", "reviewer": "张三",
+                "review_seq": f["review_seq"]})
+        issued = guards.issue_sealed_package(conn, {
+            "device_id": cls.dev["device_id"],
+            "version_id": cls.built["version_id"]})
+        cls.seal_id = issued["seal_id"]
+        got = guards.download_sealed_package(
+            conn, issued["seal_id"],
+            {"download_token": issued["download_token"]})
+        conn.close()
+
+        cls.home = tempfile.mkdtemp()
+        cls.seal_file = os.path.join(cls.home, "seal.json")
+        cls.secret_file = os.path.join(cls.home, "device.key")
+        with open(cls.seal_file, "w", encoding="utf-8") as f:
+            json.dump(got["envelope"], f)
+        with open(cls.secret_file, "w", encoding="utf-8") as f:
+            f.write(cls.dev["secret_key"])
+        cls.store = os.path.join(cls.home, "seal-ledger")
+
+    @classmethod
+    def tearDownClass(cls):
+        import shutil
+        shutil.rmtree(cls.home, ignore_errors=True)
+        for ext in ("", "-wal", "-shm"):
+            p = cls.db_path + ext
+            if os.path.exists(p):
+                os.remove(p)
+
+    def _run(self, *args, env_extra=None):
+        # cwd 用隔离的空 HOME（只有封存包与密钥，没有任何数据库文件），
+        # 仅靠 PYTHONPATH 定位纯函数模块——证明核对不需要服务进程/数据库。
+        env = {"PATH": os.environ.get("PATH", ""),
+               "HOME": self.home, "TERM": "dumb",
+               "PYTHONPATH": self.REPO}
+        if env_extra:
+            env.update(env_extra)
+        proc = subprocess.run(
+            [sys.executable, "-m", "app.sealctl", *args],
+            cwd=self.home, env=env, capture_output=True, text=True,
+            timeout=60)
+        body = None
+        try:
+            body = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            pass
+        return proc.returncode, body, proc.stdout + proc.stderr
+
+    def _assert_no_db_touched(self):
+        # CLI 运行目录与默认库路径下都不应产生数据库文件
+        for name in os.listdir(self.home):
+            self.assertFalse(name.endswith(".db"),
+                             f"离线核对意外创建数据库：{name}")
+
+    def _load_seal(self):
+        with open(self.seal_file, encoding="utf-8") as f:
+            return json.load(f)
+
+    def _write_home(self, name, obj):
+        with open(os.path.join(self.home, name), "w",
+                  encoding="utf-8") as f:
+            json.dump(obj, f)
+
+    def test_23_show_and_verify_offline(self):
+        rc, body, _ = self._run("show", "seal.json", "--json")
+        self.assertEqual(rc, 0)
+        self.assertEqual(body["summary"]["device_id"],
+                         self.dev["device_id"])
+        self.assertEqual(body["summary"]["version_id"],
+                         self.built["version_id"])
+        self.assertGreater(body["summary"]["event_count"], 0)
+        rc, body, _ = self._run(
+            "verify", "seal.json", "--device", self.dev["device_id"],
+            "--secret-file", "device.key", "--json")
+        self.assertEqual(rc, 0, body)
+        s = body["summary"]
+        self.assertTrue(s["verified"])
+        self.assertEqual(s["review_pending"], 0)
+        self.assertEqual(s["version_status"], "sealed")
+        self.assertEqual(len(s["events_sha256"]), 64)
+        self._assert_no_db_touched()
+
+    def test_24_import_once_then_duplicate_rejected(self):
+        rc, _, txt = self._run(
+            "import", "seal.json", "--device", self.dev["device_id"],
+            "--secret-file", "device.key", "--store", "ledger")
+        self.assertEqual(rc, 0, txt)
+        rc, body, txt = self._run(
+            "import", "seal.json", "--device", self.dev["device_id"],
+            "--secret-file", "device.key", "--store", "ledger",
+            "--json")
+        self.assertEqual(rc, 5, txt)
+        self.assertEqual(body["error"], "seal_duplicate_import")
+        # verify（只读）不受导入台账影响，仍然通过
+        rc, body, _ = self._run(
+            "verify", "seal.json", "--device", self.dev["device_id"],
+            "--secret-file", "device.key", "--json")
+        self.assertEqual(rc, 0)
+
+    def test_25_cross_device_rejected(self):
+        rc, body, txt = self._run(
+            "verify", "seal.json", "--device", "DEV-ELSE",
+            "--secret-file", "device.key", "--json")
+        self.assertEqual(rc, 4, txt)
+        self.assertEqual(body["error"], "seal_cross_device")
+
+    def test_26_tampered_package_rejected(self):
+        env = self._load_seal()
+        env["manifest"]["events"][0]["value"] = 999.0
+        self._write_home("tampered.json", env)
+        rc, body, txt = self._run(
+            "verify", "tampered.json", "--device", self.dev["device_id"],
+            "--secret-file", "device.key", "--json")
+        self.assertEqual(rc, 3, txt)
+        self.assertEqual(body["error"], "seal_tampered")
+        # 篡改数量声明同理
+        env = self._load_seal()
+        env["manifest"]["event_count"] += 1
+        self._write_home("tampered2.json", env)
+        rc, body, _ = self._run(
+            "verify", "tampered2.json", "--device", self.dev["device_id"],
+            "--secret-file", "device.key", "--json")
+        self.assertEqual(rc, 3)
+        self.assertEqual(body["error"], "seal_tampered")
+
+    def test_27_stale_version_rejected(self):
+        # 清单自声明 superseded（重新签名一个旧版封包）→ 失效版本
+        secret = self.dev["secret_key"]
+        env = self._load_seal()
+        old = json.loads(json.dumps(env))
+        old["seal_id"] = "SEA-OLD"
+        old["manifest"]["seal_id"] = "SEA-OLD"
+        old["manifest"]["version"]["version_id"] = "VER-000-19990101-001"
+        self._write_home("old.json",
+                         sealmod.seal_envelope(secret, old["manifest"]))
+        # 先导入当前封存包（更新的版本）
+        rc, _, txt = self._run(
+            "import", "seal.json", "--device", self.dev["device_id"],
+            "--secret-file", "device.key", "--store", "stale-ledger")
+        self.assertEqual(rc, 0, txt)
+        # 再导入更旧版本 → seal_version_stale
+        rc, body, txt = self._run(
+            "import", "old.json", "--device", self.dev["device_id"],
+            "--secret-file", "device.key", "--store", "stale-ledger",
+            "--json")
+        self.assertEqual(rc, 6, txt)
+        self.assertEqual(body["error"], "seal_version_stale")
+
+    def test_28_malformed_and_missing_secret(self):
+        with open(os.path.join(self.home, "broken.json"), "w",
+                  encoding="utf-8") as f:
+            f.write("{not json")
+        rc, body, txt = self._run(
+            "verify", "broken.json", "--device", self.dev["device_id"],
+            "--secret-file", "device.key", "--json")
+        self.assertEqual(rc, 2, txt)
+        self.assertEqual(body["error"], "seal_malformed")
+        rc, body, txt = self._run(
+            "verify", "seal.json", "--device", self.dev["device_id"],
+            "--store", "never-used", "--json")
+        self.assertEqual(rc, 7, txt)
+        self.assertEqual(body["error"], "seal_device_unknown")
+
 
 class HttpSmokeTest(unittest.TestCase):
     """HTTP 层冒烟：上传→提交→重建→复核→导出→验证 全链路。"""
@@ -631,6 +1006,58 @@ class HttpSmokeTest(unittest.TestCase):
             "device_id": device_id, "report": exported["report"]})
         self.assertEqual(status, 403)
         self.assertEqual(rejected["error"], "signature_mismatch")
+
+        # 一次性事件封存包
+        # 该版本唯一的复核项在上面已闭环，先验证一次成功封存的完整链路；
+        # 未闭环闸门用随后重建产生的新版本单独验证。
+        status, issued = self.api("POST", "/api/seals/issue", {
+            "device_id": device_id, "version_id": built["version_id"],
+            "issued_by": "操作员甲"})
+        self.assertEqual(status, 200)
+        self.assertTrue(issued["download_token"])
+        seal_id, token = issued["seal_id"], issued["download_token"]
+        # 重复发放 → 409
+        status, again = self.api("POST", "/api/seals/issue", {
+            "device_id": device_id, "version_id": built["version_id"]})
+        self.assertEqual(status, 409)
+        self.assertEqual(again["error"], "seal_already_issued")
+        # 错令牌 → 403
+        status, badtok = self.api(
+            "POST", f"/api/seals/{seal_id}/download",
+            {"download_token": "nope"})
+        self.assertEqual(status, 403)
+        self.assertEqual(badtok["error"], "seal_token_invalid")
+        # 正确令牌 → 拿到自包含封存包
+        status, dl = self.api("POST", f"/api/seals/{seal_id}/download",
+                              {"download_token": token})
+        self.assertEqual(status, 200)
+        envelope = dl["envelope"]
+        self.assertEqual(envelope["format"], "replay-seal/v1")
+        self.assertGreater(envelope["manifest"]["event_count"], 0)
+        self.assertEqual(
+            envelope["manifest"]["event_count"],
+            len(envelope["manifest"]["events"]))
+        self.assertEqual(
+            envelope["manifest"]["review_summary"]["pending"], 0)
+        # 令牌用后即焚：再次下载 403
+        status, second = self.api(
+            "POST", f"/api/seals/{seal_id}/download",
+            {"download_token": token})
+        self.assertEqual(status, 403)
+        # 台账列表
+        status, listing = self.api("GET", f"/api/seals?device_id={device_id}")
+        self.assertEqual(status, 200)
+        self.assertEqual(listing["seals"][0]["status"], "downloaded")
+        # 封存后重建产生新版本（旧封存版本保持 sealed 终态），新复核项
+        # 未闭环时封存 → 409 review_not_closed
+        status, rebuilt = self.api(
+            "POST", f"/api/devices/{device_id}/timeline/build")
+        self.assertEqual(status, 200)
+        status, notclosed = self.api("POST", "/api/seals/issue", {
+            "device_id": device_id,
+            "version_id": rebuilt["version_id"]})
+        self.assertEqual(status, 409)
+        self.assertEqual(notclosed["error"], "review_not_closed")
 
 
 if __name__ == "__main__":

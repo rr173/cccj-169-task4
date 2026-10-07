@@ -18,7 +18,7 @@ python3 -m app 8081              # 启动，浏览器访问 http://localhost:808
 测试：
 
 ```bash
-python3 -m unittest tests.test_replay -v   # 22 个用例（含 HTTP 全链路冒烟）
+python3 -m unittest tests.test_replay -v   # 33 个用例（含离线封存包子进程核对）
 ```
 
 ## 核心不变量（业务红线）
@@ -50,6 +50,23 @@ python3 -m unittest tests.test_replay -v   # 22 个用例（含 HTTP 全链路�
 7. **审计报告签名**：报告 payload 规范化 JSON 后用**设备密钥** HMAC-SHA256
    签名，签名覆盖 `device_id` 等全部字段——跨设备加载 `403 cross_device_report`，
    任何字段被改 `403 signature_mismatch`（`test_15/16/17`）。
+8. **一次性事件封存包**：风险复核全部闭环后，可对「设备 × 当前 active 版本」
+   封存**自包含**事件包（内嵌全量校正事件 + 全部复核结论 + 完整性证明，
+   设备密钥 HMAC 外层签名）。封存即把版本冻结为终态 `sealed`（重建时间线
+   只取代 active 版本；不可变触发器同时覆盖封存包引用）。封存包每个
+   （设备 × 版本）只发一次，凭**用后即焚的一次性令牌**只能下载一次
+   （`test_18..22`）。离线命令行 `python3 -m app.sealctl` 只依赖标准库、
+   不连服务与数据库即可核对设备 / 时间线版本 / 事件数量 / 完整性证明，
+   四类拒绝错误码与退出码可区分（`test_23..28`）：
+
+   | 情形 | 错误码（退出码） |
+   |---|---|
+   | 封存包被改动（签名/指纹/数量不符） | `seal_tampered`（3） |
+   | 换设备使用（`--device` 不一致） | `seal_cross_device`（4） |
+   | 重复导入本地操作员台账 | `seal_duplicate_import`（5） |
+   | 引用已失效版本（清单自声明 superseded，或比已导入版本更旧） | `seal_version_stale`（6） |
+
+   另：文件损坏 `seal_malformed`（2），缺少设备密钥 `seal_device_unknown`（7）。
 
 ## 事件格式
 
@@ -89,6 +106,26 @@ python3 -m unittest tests.test_replay -v   # 22 个用例（含 HTTP 全链路�
 | GET | `/api/findings/{id}/history` | 处理历史 |
 | POST | `/api/reports/export` | 导出签名报告 `{device_id, version_id}` |
 | POST | `/api/reports/verify` | 验证并加载 `{device_id, report}` |
+| POST | `/api/seals/issue` | 复核闭环后封存 `{device_id, version_id, issued_by}`；返回**一次性** download_token |
+| POST | `/api/seals/{id}/download` | 凭令牌下载封存包 `{download_token}`；令牌用后即焚，重复下载 403 |
+| GET | `/api/seals?device_id=` | 封存发放台账（不含令牌与包内容） |
+
+## 离线封存包核对工具（无服务 / 无数据库）
+
+`app/sealctl.py` 只导入标准库与纯函数模块 `app/seal.py`（绝不连数据库），
+设备密钥来自 `--secret-file` / `--secret` / `REPLAY_DEVICE_SECRET`：
+
+```bash
+python3 -m app.sealctl verify  封包.json --device DEV-X --secret-file dev.key
+python3 -m app.sealctl import  封包.json --device DEV-X --secret-file dev.key \
+                               [--store ~/.replay-seals]   # 写入本地操作员台账
+python3 -m app.sealctl show    封包.json                     # 只看头部（不验签）
+```
+
+`verify` 只读核对并打印设备、时间线版本（含漂移参数）、事件数量、复核
+闭环情况与 SHA-256/HMAC 完整性证明；`import` 额外在本地 JSON 台账中
+去重（`seal_id`）并阻止导入比已导入版本更旧的封存包。加 `--json`
+得到机器可读输出。
 
 ## 网页
 
@@ -98,6 +135,8 @@ python3 -m unittest tests.test_replay -v   # 22 个用例（含 HTTP 全链路�
   超限点标红）→ 滑块回放 → 原始/校正对照表
 - **风险复核**：按状态过滤，接受/驳回/退回重算（409 自动刷新），处理历史
 - **审计报告**：导出签名报告（可下载 JSON）、粘贴验证加载
+- **封存包**：复核闭环后发放封存包（一次性令牌、立即下载），发放台账，
+  离线 `sealctl` 命令用法说明
 
 ## 代码结构
 
@@ -105,12 +144,15 @@ python3 -m unittest tests.test_replay -v   # 22 个用例（含 HTTP 全链路�
 app/
   db.py       SQLite schema + 不可变触发器（WAL + busy_timeout + 外键）
   core.py     规范化 JSON、HMAC 签名、ID 生成、ApiError
+  seal.py     封存包纯函数：构造 / 解析 / 验签 / 完整性指纹（不碰数据库）
+  sealctl.py  离线命令行核对工具（python3 -m app.sealctl，仅标准库）
   clock.py    时钟漂移最小二乘拟合（纯函数）
   detect.py   连续超限 / 缺失区间 / 计量跳变识别（纯函数）
   guards.py   全部状态迁移（每个迁移一个 BEGIN IMMEDIATE 事务）
   server.py   stdlib HTTP：JSON API + SPA 静态托管
-tests/        22 个端到端不变量用例（含并发复核、失败回滚、HTTP 冒烟）
-seed.py       演示数据
+tests/        33 个端到端不变量用例（含并发复核、失败回滚、HTTP 冒烟、
+                离线封存包子进程核对）
+seed.py       演示数据（含一份可离线核对的封存包示例）
 web/          index.html / styles.css / app.js（原生 JS SPA）
 ```
 

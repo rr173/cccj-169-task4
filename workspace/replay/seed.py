@@ -114,6 +114,30 @@ def main():
         "device_id": dev_a["device_id"],
         "version_id": versions[0]["version_id"]})
 
+    # 演示一次性事件封存包：闭环当前 active 版本的全部复核项 → 封存
+    import json as _json
+    active_vid = next(v["version_id"] for v in versions
+                      if v["status"] == "active")
+    for fnd in guards.list_findings(conn, device_id=dev_a["device_id"],
+                                    status="pending"):
+        if fnd["version_id"] == active_vid:
+            guards.review_finding(conn, fnd["finding_id"], {
+                "action": "accept", "reviewer": "张三",
+                "note": "演示：批量闭环后封存",
+                "review_seq": fnd["review_seq"]})
+    sealed = guards.issue_sealed_package(conn, {
+        "device_id": dev_a["device_id"], "version_id": active_vid,
+        "issued_by": "张三"})
+    downloaded = guards.download_sealed_package(conn, sealed["seal_id"], {
+        "download_token": sealed["download_token"]})
+    data_dir = os.path.dirname(os.path.abspath(__file__))
+    seal_path = os.path.join(data_dir, "data", f"{sealed['seal_id']}.json")
+    with open(seal_path, "w", encoding="utf-8") as f:
+        _json.dump(downloaded["envelope"], f, ensure_ascii=False, indent=2)
+    key_path = os.path.join(data_dir, "data", f"{dev_a['device_id']}.key")
+    with open(key_path, "w", encoding="utf-8") as f:
+        f.write(dev_a["secret_key"])
+
     print("演示数据已就绪：")
     print(f"  {dev_a['device_id']}  挤出机-A（漂移+异常） "
           f"事件 {built_a['event_count']} 条，"
@@ -121,6 +145,11 @@ def main():
     print(f"  {dev_b['device_id']}  挤出机-B（正常）")
     print(f"  已演示：接受 1 项、退回重算 1 项、"
           f"签名报告 {report['report']['payload']['report_id']}")
+    print(f"  已封存：{sealed['seal_id']}（版本 {active_vid}，"
+          f"事件 {sealed['event_count']}，复核 {sealed['review_total']}）")
+    print("  离线核对（无服务/无数据库）：")
+    print(f"    python3 -m app.sealctl verify {seal_path} \\")
+    print(f"        --device {dev_a['device_id']} --secret-file {key_path}")
     print("启动服务: python3 -m app 8081  →  http://localhost:8081")
 
 

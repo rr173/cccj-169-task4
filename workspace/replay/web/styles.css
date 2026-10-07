@@ -115,5 +115,8 @@ canvas {
 .badge.returned { color: var(--accent); border-color: var(--accent); }
 .badge.active   { color: var(--ok);   border-color: var(--ok); }
 .badge.superseded { color: var(--muted); }
+.badge.sealed   { color: var(--accent); border-color: var(--accent); }
+.badge.ready    { color: var(--warn); border-color: var(--warn); }
+.badge.downloaded { color: var(--ok); border-color: var(--ok); }
 footer { padding: 12px 22px; border-top: 1px solid var(--line); }
 code { color: var(--accent); }

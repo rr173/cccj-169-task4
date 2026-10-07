@@ -72,7 +72,7 @@ CREATE TABLE IF NOT EXISTS timeline_versions (
     clock_scale     REAL NOT NULL,
     source_events   INTEGER NOT NULL,
     status          TEXT NOT NULL DEFAULT 'active'
-                        CHECK(status IN ('active','superseded')),
+                        CHECK(status IN ('active','superseded','sealed')),
     created_at      TEXT NOT NULL
 );
 
@@ -127,6 +127,24 @@ CREATE TABLE IF NOT EXISTS reports (
     created_at  TEXT NOT NULL
 );
 
+-- 一次性事件封存包：复核全部闭环后对（设备 × 时间线版本）封存。
+-- download_token 只在发放时返回一次；downloaded_at 非空后令牌立即失效。
+CREATE TABLE IF NOT EXISTS sealed_packages (
+    seal_id         TEXT PRIMARY KEY,
+    device_id       TEXT NOT NULL,
+    version_id      TEXT NOT NULL REFERENCES timeline_versions(version_id),
+    envelope        TEXT NOT NULL,          -- 签名后的完整封存包 JSON
+    event_count     INTEGER NOT NULL,
+    review_total    INTEGER NOT NULL,
+    download_token  TEXT NOT NULL UNIQUE,
+    issued_by       TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'ready'
+                        CHECK(status IN ('ready','downloaded')),
+    created_at      TEXT NOT NULL,
+    downloaded_at   TEXT,
+    UNIQUE(device_id, version_id)
+);
+
 CREATE TABLE IF NOT EXISTS events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     device_id   TEXT,
@@ -141,12 +159,13 @@ CREATE INDEX IF NOT EXISTS idx_findings_device ON findings(device_id);
 CREATE INDEX IF NOT EXISTS idx_findings_version ON findings(version_id);
 CREATE INDEX IF NOT EXISTS idx_history_finding ON review_history(finding_id);
 
--- 不可变红线：版本一旦被 findings 或 reports 引用，
+-- 不可变红线：版本一旦被 findings / reports / sealed_packages 引用，
 -- 其校正参数与校正事件一律禁止 UPDATE/DELETE（只能另建新版本）。
 CREATE TRIGGER IF NOT EXISTS trg_corrected_no_update
 BEFORE UPDATE ON corrected_events
 WHEN EXISTS (SELECT 1 FROM findings  WHERE version_id = OLD.version_id)
   OR EXISTS (SELECT 1 FROM reports   WHERE version_id = OLD.version_id)
+  OR EXISTS (SELECT 1 FROM sealed_packages WHERE version_id = OLD.version_id)
 BEGIN
     SELECT RAISE(ABORT, 'version_referenced_immutable');
 END;
@@ -155,6 +174,7 @@ CREATE TRIGGER IF NOT EXISTS trg_corrected_no_delete
 BEFORE DELETE ON corrected_events
 WHEN EXISTS (SELECT 1 FROM findings  WHERE version_id = OLD.version_id)
   OR EXISTS (SELECT 1 FROM reports   WHERE version_id = OLD.version_id)
+  OR EXISTS (SELECT 1 FROM sealed_packages WHERE version_id = OLD.version_id)
 BEGIN
     SELECT RAISE(ABORT, 'version_referenced_immutable');
 END;
@@ -164,6 +184,7 @@ BEFORE UPDATE OF algo_version, clock_offset, clock_scale, source_events
 ON timeline_versions
 WHEN EXISTS (SELECT 1 FROM findings  WHERE version_id = OLD.version_id)
   OR EXISTS (SELECT 1 FROM reports   WHERE version_id = OLD.version_id)
+  OR EXISTS (SELECT 1 FROM sealed_packages WHERE version_id = OLD.version_id)
 BEGIN
     SELECT RAISE(ABORT, 'version_referenced_immutable');
 END;
@@ -172,6 +193,7 @@ CREATE TRIGGER IF NOT EXISTS trg_version_no_delete
 BEFORE DELETE ON timeline_versions
 WHEN EXISTS (SELECT 1 FROM findings  WHERE version_id = OLD.version_id)
   OR EXISTS (SELECT 1 FROM reports   WHERE version_id = OLD.version_id)
+  OR EXISTS (SELECT 1 FROM sealed_packages WHERE version_id = OLD.version_id)
 BEGIN
     SELECT RAISE(ABORT, 'version_referenced_immutable');
 END;
@@ -235,3 +257,49 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # 老触发器（若有）引用旧列定义，统一删后重建
         conn.execute("DROP TRIGGER IF EXISTS trg_chunk_no_update")
         conn.execute("DROP TRIGGER IF EXISTS trg_chunk_no_delete")
+    # 版本不可变触发器的引用集合随版本演进（新增 sealed_packages 引用），
+    # 老库中的旧触发器定义不会被 CREATE TRIGGER IF NOT EXISTS 替换，
+    # 先统一删除，再由 init_db 按最新定义重建（触发规则只增不减）。
+    for t in ("trg_corrected_no_update", "trg_corrected_no_delete",
+              "trg_version_no_retarget", "trg_version_no_delete"):
+        conn.execute(f"DROP TRIGGER IF EXISTS {t}")
+    _migrate_version_status(conn)
+
+
+def _migrate_version_status(conn: sqlite3.Connection) -> None:
+    """封存功能引入了版本终态 'sealed'。老库的 timeline_versions 只有
+    CHECK(active/superseded)，CREATE TABLE IF NOT EXISTS 不会改约束，
+    需要整表重建（外键临时关闭；触发器在 init_db 中按最新定义重建）。"""
+    sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' "
+        "AND name='timeline_versions'").fetchone()
+    if sql is None or "'sealed'" in sql["sql"]:
+        return  # 新库（稍后按新 schema 建）或已迁移
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        conn.execute("BEGIN")
+        conn.execute(
+            "CREATE TABLE timeline_versions_new ("
+            "version_id TEXT PRIMARY KEY, device_id TEXT NOT NULL "
+            "REFERENCES devices(device_id), algo_version TEXT NOT NULL,"
+            " clock_offset REAL NOT NULL, clock_scale REAL NOT NULL,"
+            " source_events INTEGER NOT NULL,"
+            " status TEXT NOT NULL DEFAULT 'active'"
+            " CHECK(status IN ('active','superseded','sealed')),"
+            " created_at TEXT NOT NULL)")
+        conn.execute(
+            "INSERT INTO timeline_versions_new(version_id, device_id,"
+            " algo_version, clock_offset, clock_scale, source_events,"
+            " status, created_at) "
+            "SELECT version_id, device_id, algo_version, clock_offset,"
+            " clock_scale, source_events, status, created_at "
+            "FROM timeline_versions")
+        conn.execute("DROP TABLE timeline_versions")
+        conn.execute("ALTER TABLE timeline_versions_new "
+                     "RENAME TO timeline_versions")
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
