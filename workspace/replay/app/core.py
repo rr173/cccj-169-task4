@@ -64,6 +64,34 @@ def verify_device_payload(secret: str, payload: dict, signature: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Sealed package signatures (one-time seal key, one key per package)
+# ---------------------------------------------------------------------------
+
+SEAL_FORMAT = "event-seal-v1"
+
+
+def new_seal_key() -> str:
+    """一次性封存密钥：每个封存包独立一把，仅下载时返回一次。"""
+    return secrets.token_hex(32)
+
+
+def sign_seal_payload(key: str, payload: dict) -> str:
+    """用封存包一次性密钥对 payload 做 HMAC-SHA256。
+
+    签名覆盖 payload 全部字段（含 seal_id / device_id / version_id /
+    version_status / events / 完整性证明），任何字段被改或换设备引用
+    都会验签失败。
+    """
+    return hmac.new(key.encode("utf-8"), canonical(payload).encode("utf-8"),
+                    hashlib.sha256).hexdigest()
+
+
+def verify_seal_payload(key: str, payload: dict, signature: str) -> bool:
+    expected = sign_seal_payload(key, payload)
+    return hmac.compare_digest(expected, signature or "")
+
+
+# ---------------------------------------------------------------------------
 # Identifier generation (per-day sequence, like the sibling platform)
 # ---------------------------------------------------------------------------
 
@@ -95,6 +123,10 @@ def new_finding_id(conn: sqlite3.Connection) -> str:
 
 def new_report_id(conn: sqlite3.Connection) -> str:
     return f"REP-{_day_seq(conn, 'report')}"
+
+
+def new_seal_id(conn: sqlite3.Connection) -> str:
+    return f"SEAL-{_day_seq(conn, 'seal')}"
 
 
 def log_event(conn: sqlite3.Connection, device_id: str | None,

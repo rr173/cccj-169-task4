@@ -22,6 +22,7 @@
   <button class="tab" data-tab="timeline">时间线回放</button>
   <button class="tab" data-tab="review">风险复核</button>
   <button class="tab" data-tab="reports">审计报告</button>
+  <button class="tab" data-tab="seals">封存包</button>
 </nav>
 
 <main>
@@ -150,6 +151,58 @@
           <button id="verify-report" type="button">验证并加载</button>
         </div>
         <div id="verify-result" class="notice hidden"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 一次性事件封存包 -->
+  <section id="tab-seals" class="panel">
+    <h2>一次性事件封存包（复核完成后下载 · 离线核对）</h2>
+    <p class="muted">
+      封存前提：所选版本为当前有效版本（active），且该版本全部复核项均已处置。
+      封存包用<b>每包一把的一次性密钥</b>签名，密钥仅在封存时显示一次；服务端只存密钥哈希。
+      操作员在无服务、无数据库的命令行中执行
+      <code>python3 sealcli.py verify 封存包.json --device 设备号 --key 一次性密钥</code>
+      核对设备 / 时间线版本 / 事件数量 / 完整性证明（SHA-256）。
+    </p>
+    <div class="grid2">
+      <div>
+        <h3>按版本封存</h3>
+        <div class="inline-form">
+          <label>版本 <select id="seal-version"></select></label>
+          <button id="create-seal" type="button">封存并生成一次性密钥</button>
+        </div>
+        <div id="seal-status" class="muted"></div>
+        <div id="seal-key-box" class="notice hidden"></div>
+        <pre id="seal-output" class="log hidden"></pre>
+        <div class="inline-form">
+          <button id="download-seal" type="button" class="hidden">下载封存包 JSON</button>
+          <button id="copy-seal-cmd" type="button" class="ghost hidden">复制核对命令</button>
+        </div>
+        <div id="seal-cmd-box" class="notice hidden"></div>
+      </div>
+      <div>
+        <h3>封存记录台账</h3>
+        <table id="seal-table">
+          <thead><tr>
+            <th>封存编号</th><th>设备</th><th>版本</th>
+            <th>事件数</th><th>封存时间</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+        <h3>离线核对结果代码（sealcli.py）</h3>
+        <table>
+          <thead><tr><th>退出码</th><th>错误代码</th><th>含义</th></tr></thead>
+          <tbody>
+            <tr><td>0</td><td>—</td><td>核对通过</td></tr>
+            <tr><td>2</td><td><code>seal_malformed</code></td><td>文件损坏 / 结构不合法</td></tr>
+            <tr><td>3</td><td><code>seal_tampered</code></td><td>封存包被改动（验签失败）</td></tr>
+            <tr><td>4</td><td><code>seal_device_mismatch</code></td><td>换设备使用</td></tr>
+            <tr><td>5</td><td><code>seal_version_stale</code></td><td>引用已失效版本</td></tr>
+            <tr><td>6</td><td><code>seal_integrity_failed</code></td><td>事件数量 / SHA-256 不一致</td></tr>
+            <tr><td>7</td><td><code>seal_already_imported</code></td><td>重复导入</td></tr>
+          </tbody>
+        </table>
       </div>
     </div>
   </section>

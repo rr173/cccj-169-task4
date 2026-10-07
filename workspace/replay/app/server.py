@@ -164,6 +164,15 @@ class Handler(BaseHTTPRequestHandler):
                 return guards.verify_report(conn, body)
             raise ApiError(404, "route_not_found", f"未知路径 {path}")
 
+        # /api/seals...
+        if len(p) >= 2 and p[1] == "seals":
+            if len(p) == 2 and method == "POST":
+                return guards.create_seal(conn, body)
+            if len(p) == 2 and method == "GET":
+                device_id = (query.get("device_id") or [None])[0]
+                return {"seals": guards.list_seals(conn, device_id)}
+            raise ApiError(404, "route_not_found", f"未知路径 {path}")
+
         raise ApiError(404, "route_not_found", f"未知路径 {path}")
 
     # -- static ------------------------------------------------------------

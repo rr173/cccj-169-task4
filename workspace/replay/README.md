@@ -18,8 +18,32 @@ python3 -m app 8081              # 启动，浏览器访问 http://localhost:808
 测试：
 
 ```bash
-python3 -m unittest tests.test_replay -v   # 22 个用例（含 HTTP 全链路冒烟）
+python3 -m unittest tests.test_replay -v   # 33 个用例（含 HTTP 全链路 + 离线 CLI）
 ```
+
+## 离线封存包核对（无服务、无数据库）
+
+网页「封存包」标签页选择**当前有效且复核全部完成**的版本，点击封存后：
+
+1. 下载 `SEAL-YYYYMMDD-NNN.json`（自包含：校正事件全量、复核结论、数量与
+   SHA-256 完整性证明、版本状态）；
+2. 抄下仅显示一次的 64 位一次性密钥；
+3. 在任意装有 Python 3.11 的机器上（无需安装任何东西、无需访问服务或数据库）：
+
+```bash
+# 只核对，不登记
+python3 sealcli.py verify SEAL-....json --device DEV-001 --key <一次性密钥>
+
+# 核对并登记到本地台账（原子写入）；同一封存包再次导入 → 7 seal_already_imported
+python3 sealcli.py import SEAL-....json --device DEV-001 --key <一次性密钥> \
+    --ledger ./seal-ledger.json
+
+# 不验签，仅浏览结构（不能作为信任依据）
+python3 sealcli.py show SEAL-....json
+```
+
+核对顺序固定，错误彼此可区分：结构 → 验签（篡改/密钥）→ 设备 → 版本有效性
+→ 数量与完整性证明；`import` 在全部通过后再查台账防重。
 
 ## 核心不变量（业务红线）
 
@@ -50,6 +74,25 @@ python3 -m unittest tests.test_replay -v   # 22 个用例（含 HTTP 全链路�
 7. **审计报告签名**：报告 payload 规范化 JSON 后用**设备密钥** HMAC-SHA256
    签名，签名覆盖 `device_id` 等全部字段——跨设备加载 `403 cross_device_report`，
    任何字段被改 `403 signature_mismatch`（`test_15/16/17`）。
+8. **一次性事件封存包**：复核全部完成后，操作员可对当前有效（active）版本
+   生成**自包含**封存包（含全部校正事件、复核结论、事件 SHA-256 完整性证明），
+   用**每包一把的一次性密钥** HMAC-SHA256 签名，密钥仅下载时返回一次，服务端
+   只存密钥哈希。封存前提不满足分别拒绝：版本已失效 →
+   `409 seal_version_stale`，仍有 pending 复核项 →
+   `409 seal_review_incomplete`；版本被封存后同样受不可变触发器保护
+   （`test_18~21`）。离线命令行工具 `sealcli.py`（**仅标准库，不启动服务、
+   不读数据库、不 import 服务代码**）核对设备/版本/事件数量/完整性证明，
+   四类拒绝各自返回可区分的退出码与错误代码（`test_22~28`，HTTP 全链路见
+   `HttpSmokeTest`）：
+
+   | 退出码 | 错误代码 | 触发场景 |
+   |---|---|---|
+   | 2 | `seal_malformed` | 封存包文件损坏、JSON/结构不合法 |
+   | 3 | `seal_tampered` | 封存包被改动或一次性密钥错误（验签失败） |
+   | 4 | `seal_device_mismatch` | 换设备使用（`--device` 与封存设备不一致） |
+   | 5 | `seal_version_stale` | 引用已失效（superseded）版本 |
+   | 6 | `seal_integrity_failed` | 事件数量/事件正文与 SHA-256 证明不一致 |
+   | 7 | `seal_already_imported` | 同一封存包重复导入（按包指纹，改名无效） |
 
 ## 事件格式
 
@@ -89,6 +132,8 @@ python3 -m unittest tests.test_replay -v   # 22 个用例（含 HTTP 全链路�
 | GET | `/api/findings/{id}/history` | 处理历史 |
 | POST | `/api/reports/export` | 导出签名报告 `{device_id, version_id}` |
 | POST | `/api/reports/verify` | 验证并加载 `{device_id, report}` |
+| POST | `/api/seals` | 封存当前有效版本（复核须全部完成），返回封存包 + 一次性密钥 |
+| GET | `/api/seals?device_id=` | 封存记录台账（仅元数据，不含密钥/事件正文） |
 
 ## 网页
 
@@ -98,18 +143,21 @@ python3 -m unittest tests.test_replay -v   # 22 个用例（含 HTTP 全链路�
   超限点标红）→ 滑块回放 → 原始/校正对照表
 - **风险复核**：按状态过滤，接受/驳回/退回重算（409 自动刷新），处理历史
 - **审计报告**：导出签名报告（可下载 JSON）、粘贴验证加载
+- **封存包**：按版本封存（显示可封存/待复核/已失效状态）、一次性密钥提示、
+  下载封存包、复制离线核对命令、封存记录台账与退出码对照表
 
 ## 代码结构
 
 ```
 app/
   db.py       SQLite schema + 不可变触发器（WAL + busy_timeout + 外键）
-  core.py     规范化 JSON、HMAC 签名、ID 生成、ApiError
+  core.py     规范化 JSON、HMAC 签名（设备密钥 + 封存一次性密钥）、ID 生成、ApiError
   clock.py    时钟漂移最小二乘拟合（纯函数）
   detect.py   连续超限 / 缺失区间 / 计量跳变识别（纯函数）
-  guards.py   全部状态迁移（每个迁移一个 BEGIN IMMEDIATE 事务）
+  guards.py   全部状态迁移（每个迁移一个 BEGIN IMMEDIATE 事务）+ 封存包生成
   server.py   stdlib HTTP：JSON API + SPA 静态托管
-tests/        22 个端到端不变量用例（含并发复核、失败回滚、HTTP 冒烟）
+sealcli.py    离线封存包核对/导入 CLI（独立单文件，仅标准库，无服务无数据库）
+tests/        33 个端到端不变量用例（含并发复核、失败回滚、离线 CLI、HTTP 冒烟）
 seed.py       演示数据
 web/          index.html / styles.css / app.js（原生 JS SPA）
 ```

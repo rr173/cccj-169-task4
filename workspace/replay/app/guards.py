@@ -23,10 +23,11 @@ import sqlite3
 
 from . import detect
 from .clock import correct, fit_clock
-from .core import (ApiError, canonical, log_event, new_batch_id,
+from .core import (SEAL_FORMAT, ApiError, canonical, log_event, new_batch_id,
                    new_device_id, new_device_secret, new_finding_id,
-                   new_report_id, new_version_id, sha256_text,
-                   sign_device_payload, verify_device_payload)
+                   new_report_id, new_seal_id, new_seal_key,
+                   new_version_id, sha256_text, sign_device_payload,
+                   sign_seal_payload, verify_device_payload)
 from .db import now_iso
 
 ALGO_VERSION = "clockfit-ls-v1"   # 校正+识别算法版本，随时间线一起落库
@@ -429,7 +430,12 @@ def list_versions(conn: sqlite3.Connection, device_id: str) -> list[dict]:
     rows = conn.execute(
         "SELECT v.*, "
         "  (SELECT COUNT(*) FROM findings f "
-        "    WHERE f.version_id = v.version_id) AS finding_count "
+        "    WHERE f.version_id = v.version_id) AS finding_count, "
+        "  (SELECT COUNT(*) FROM findings f "
+        "    WHERE f.version_id = v.version_id AND f.status = 'pending') "
+        "    AS pending_count, "
+        "  (SELECT COUNT(*) FROM seals s "
+        "    WHERE s.version_id = v.version_id) AS seal_count "
         "FROM timeline_versions v WHERE v.device_id = ? "
         "ORDER BY v.created_at DESC, v.version_id DESC",
         (device_id,)).fetchall()
@@ -623,3 +629,119 @@ def verify_report(conn: sqlite3.Connection, body: dict) -> dict:
     return {"ok": True, "report_id": payload.get("report_id"),
             "version_id": payload.get("version_id"),
             "finding_count": len(payload.get("findings") or [])}
+
+
+# ---------------------------------------------------------------------------
+# 一次性事件封存包：复核完成后下载，供离线 CLI 核对
+# ---------------------------------------------------------------------------
+
+def _seal_events(conn: sqlite3.Connection, version_id: str) -> list[dict]:
+    rows = conn.execute(
+        "SELECT event_uid, kind, value, device_ts, corrected_ts "
+        "FROM corrected_events WHERE version_id = ? "
+        "ORDER BY corrected_ts, event_uid", (version_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _seal_findings(conn: sqlite3.Connection, version_id: str) -> list[dict]:
+    rows = conn.execute(
+        "SELECT finding_id, ftype, kind, start_ts, end_ts, status, reviewer,"
+        "       review_note, reviewed_at "
+        "FROM findings WHERE version_id = ? ORDER BY finding_id",
+        (version_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def create_seal(conn: sqlite3.Connection, body: dict) -> dict:
+    """复核完成后封存一个时间线版本，返回一次性封存包。
+
+    闸门（不满足则拒绝封存）：
+
+    * 版本必须属于指定设备，且状态为 ``active`` —— 引用已失效
+      （superseded）版本 → ``409 seal_version_stale``；
+    * 该版本全部复核项必须已处置完（无 pending）——
+      复核未完成 → ``409 seal_review_incomplete``。
+
+    封存包用**每包一把**的一次性密钥 HMAC-SHA256 签名；服务端只存
+    密钥哈希，明文 ``seal_key`` 仅此一次随响应返回，操作员需转交
+    离线 CLI（``sealcli.py``）验签。
+    """
+    device_id = _str(body.get("device_id"), "device_id")
+    version_id = _str(body.get("version_id"), "version_id")
+    _begin(conn)
+    try:
+        _get_device(conn, device_id)
+        ver = _get_version(conn, version_id)
+        if ver["device_id"] != device_id:
+            raise ApiError(422, "version_device_mismatch",
+                           f"版本 {version_id} 不属于设备 {device_id}")
+        if ver["status"] != "active":
+            raise ApiError(
+                409, "seal_version_stale",
+                f"版本 {version_id} 已失效（{ver['status']}），"
+                "只能封存当前有效版本")
+        findings = _seal_findings(conn, version_id)
+        pending = [f for f in findings if f["status"] == "pending"]
+        if pending:
+            raise ApiError(
+                409, "seal_review_incomplete",
+                f"还有 {len(pending)} 个待复核项未处置，"
+                "复核全部完成后才能封存")
+        events = _seal_events(conn, version_id)
+        events_canonical = canonical(events)
+        seal_id = new_seal_id(conn)
+        ts = now_iso()
+        payload = {
+            "format": SEAL_FORMAT,
+            "seal_id": seal_id,
+            "device_id": device_id,
+            "version_id": version_id,
+            "algo_version": ver["algo_version"],
+            "version_status": ver["status"],   # 封存时刻的版本状态
+            "clock": {"offset": ver["clock_offset"],
+                      "scale": ver["clock_scale"]},
+            "created_at": ts,
+            "event_count": len(events),
+            "events_sha256": sha256_text(events_canonical),
+            "events": events,                 # 离线核对：设备/时间线全量事件
+            "findings": findings,             # 复核结论一并封存
+        }
+        seal_key = new_seal_key()
+        signature = sign_seal_payload(seal_key, payload)
+        package = {"format": SEAL_FORMAT, "payload": payload,
+                   "signature": signature}
+        package_sha = sha256_text(canonical(package))
+        conn.execute(
+            "INSERT INTO seals(seal_id, device_id, version_id, seal_key_hash,"
+            " package_sha256, event_count, pending_count, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (seal_id, device_id, version_id, sha256_text(seal_key),
+             package_sha, len(events), 0, ts))
+        log_event(conn, device_id, "seal_created",
+                  {"seal_id": seal_id, "version_id": version_id,
+                   "event_count": len(events),
+                   "finding_count": len(findings)})
+        conn.execute("COMMIT")
+        return {"seal_id": seal_id, "seal_key": seal_key,
+                "package": package, "package_sha256": package_sha}
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+
+
+def list_seals(conn: sqlite3.Connection,
+               device_id: str | None = None) -> list[dict]:
+    """封存记录台账（不含密钥与事件正文，仅元数据）。"""
+    if device_id:
+        _get_device(conn, device_id)
+        rows = conn.execute(
+            "SELECT seal_id, device_id, version_id, package_sha256,"
+            " event_count, pending_count, created_at FROM seals "
+            "WHERE device_id = ? ORDER BY created_at DESC, seal_id DESC",
+            (device_id,)).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT seal_id, device_id, version_id, package_sha256,"
+            " event_count, pending_count, created_at FROM seals "
+            "ORDER BY created_at DESC, seal_id DESC").fetchall()
+    return [dict(r) for r in rows]

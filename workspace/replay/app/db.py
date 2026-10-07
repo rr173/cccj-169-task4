@@ -127,6 +127,21 @@ CREATE TABLE IF NOT EXISTS reports (
     created_at  TEXT NOT NULL
 );
 
+-- 一次性事件封存包：复核完成后由操作员下载，离线 CLI 用一次性密钥验签。
+-- 服务端只存一次性密钥的 SHA-256（seal_key_hash），密钥明文仅在下载时
+-- 返回一次；package_sha256 为封存包文件（{format,payload,signature}
+-- 规范化 JSON）的整体指纹，离线导入台账据此去重。
+CREATE TABLE IF NOT EXISTS seals (
+    seal_id         TEXT PRIMARY KEY,
+    device_id       TEXT NOT NULL,
+    version_id      TEXT NOT NULL REFERENCES timeline_versions(version_id),
+    seal_key_hash   TEXT NOT NULL,          -- 一次性密钥的 SHA-256（不存明文）
+    package_sha256  TEXT NOT NULL,
+    event_count     INTEGER NOT NULL,
+    pending_count   INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     device_id   TEXT,
@@ -141,12 +156,13 @@ CREATE INDEX IF NOT EXISTS idx_findings_device ON findings(device_id);
 CREATE INDEX IF NOT EXISTS idx_findings_version ON findings(version_id);
 CREATE INDEX IF NOT EXISTS idx_history_finding ON review_history(finding_id);
 
--- 不可变红线：版本一旦被 findings 或 reports 引用，
+-- 不可变红线：版本一旦被 findings / reports / seals 引用，
 -- 其校正参数与校正事件一律禁止 UPDATE/DELETE（只能另建新版本）。
 CREATE TRIGGER IF NOT EXISTS trg_corrected_no_update
 BEFORE UPDATE ON corrected_events
 WHEN EXISTS (SELECT 1 FROM findings  WHERE version_id = OLD.version_id)
   OR EXISTS (SELECT 1 FROM reports   WHERE version_id = OLD.version_id)
+  OR EXISTS (SELECT 1 FROM seals     WHERE version_id = OLD.version_id)
 BEGIN
     SELECT RAISE(ABORT, 'version_referenced_immutable');
 END;
@@ -155,6 +171,7 @@ CREATE TRIGGER IF NOT EXISTS trg_corrected_no_delete
 BEFORE DELETE ON corrected_events
 WHEN EXISTS (SELECT 1 FROM findings  WHERE version_id = OLD.version_id)
   OR EXISTS (SELECT 1 FROM reports   WHERE version_id = OLD.version_id)
+  OR EXISTS (SELECT 1 FROM seals     WHERE version_id = OLD.version_id)
 BEGIN
     SELECT RAISE(ABORT, 'version_referenced_immutable');
 END;
@@ -164,6 +181,7 @@ BEFORE UPDATE OF algo_version, clock_offset, clock_scale, source_events
 ON timeline_versions
 WHEN EXISTS (SELECT 1 FROM findings  WHERE version_id = OLD.version_id)
   OR EXISTS (SELECT 1 FROM reports   WHERE version_id = OLD.version_id)
+  OR EXISTS (SELECT 1 FROM seals     WHERE version_id = OLD.version_id)
 BEGIN
     SELECT RAISE(ABORT, 'version_referenced_immutable');
 END;
@@ -172,6 +190,7 @@ CREATE TRIGGER IF NOT EXISTS trg_version_no_delete
 BEFORE DELETE ON timeline_versions
 WHEN EXISTS (SELECT 1 FROM findings  WHERE version_id = OLD.version_id)
   OR EXISTS (SELECT 1 FROM reports   WHERE version_id = OLD.version_id)
+  OR EXISTS (SELECT 1 FROM seals     WHERE version_id = OLD.version_id)
 BEGIN
     SELECT RAISE(ABORT, 'version_referenced_immutable');
 END;
@@ -215,8 +234,13 @@ def init_db(conn: sqlite3.Connection) -> None:
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """轻量迁移：老版本库的 batch_chunks 没有 payload_sha256 列，
-    补上并用现有 payload 回填指纹，再由 init_db 挂不可变触发器。"""
+    """轻量迁移：
+
+    * 老版本库的 batch_chunks 没有 payload_sha256 列，补上并用现有
+      payload 回填指纹，再由 init_db 挂不可变触发器。
+    * 封存包特性加入前，版本不可变触发器只检查 findings/reports；对
+      已建库统一 DROP 后由 SCHEMA 重建，使 seals 引用同样受保护。
+    """
     cols = {r["name"] for r in
             conn.execute("PRAGMA table_info(batch_chunks)").fetchall()}
     if cols and "payload_sha256" not in cols:
@@ -232,6 +256,16 @@ def _migrate(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "UPDATE batch_chunks SET payload_sha256 = ? WHERE rowid = ?",
                 (digest, r["rowid"]))
-        # 老触发器（若有）引用旧列定义，统一删后重建
-        conn.execute("DROP TRIGGER IF EXISTS trg_chunk_no_update")
-        conn.execute("DROP TRIGGER IF EXISTS trg_chunk_no_delete")
+    if cols:
+        # 已存在的库：旧触发器定义不含 seals，删后由 SCHEMA 统一重建
+        for name in ("trg_chunk_no_update", "trg_chunk_no_delete"):
+            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+    seal_tables = {r["name"] for r in
+                   conn.execute(
+                       "SELECT name FROM sqlite_master WHERE type='table'"
+                   ).fetchall()}
+    if "seals" not in seal_tables:
+        # 封存包功能首次上线：重建版本不可变触发器以覆盖 seals 引用
+        for name in ("trg_corrected_no_update", "trg_corrected_no_delete",
+                     "trg_version_no_retarget", "trg_version_no_delete"):
+            conn.execute(f"DROP TRIGGER IF EXISTS {name}")

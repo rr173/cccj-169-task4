@@ -59,6 +59,7 @@ function refreshTab(tab) {
   if (tab === "timeline") loadVersions();
   if (tab === "review") loadFindings();
   if (tab === "reports") loadReportVersions();
+  if (tab === "seals") loadSealView();
 }
 
 /* ------------------------------------------------------------------ */
@@ -532,6 +533,110 @@ $("#verify-report").addEventListener("click", async () => {
   } catch (e) {
     box.className = "notice bad";
     box.textContent = `拒绝加载：${e.message}`;
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* 一次性事件封存包                                                      */
+/* ------------------------------------------------------------------ */
+state.lastSeal = null;
+
+async function loadSealView() {
+  if (!state.deviceId) return;
+  const [{ versions }, { seals }] = await Promise.all([
+    api("GET", `/api/devices/${state.deviceId}/versions`),
+    api("GET", `/api/seals?device_id=${state.deviceId}`),
+  ]);
+  state.sealVersions = versions;
+  const sel = $("#seal-version");
+  sel.innerHTML = versions.map((v) => {
+    const note = v.status !== "active"
+      ? "（已失效，不可封存）"
+      : v.pending_count > 0
+        ? `（${v.pending_count} 项待复核）`
+        : "（可封存）";
+    return `<option value="${esc(v.version_id)}">${esc(v.version_id)}`
+         + `（${v.status}）${note}</option>`;
+  }).join("");
+  renderSealStatus();
+  $("#seal-table tbody").innerHTML = seals.map((s) => `
+    <tr>
+      <td>${esc(s.seal_id)}</td>
+      <td>${esc(s.device_id)}</td>
+      <td>${esc(s.version_id)}</td>
+      <td>${s.event_count}</td>
+      <td>${fmtTime(s.created_at)}</td>
+    </tr>`).join("");
+}
+
+function renderSealStatus() {
+  const id = $("#seal-version").value;
+  const v = (state.sealVersions || []).find((x) => x.version_id === id);
+  const box = $("#seal-status");
+  if (!v) { box.textContent = "没有可选版本"; return; }
+  if (v.status !== "active") {
+    box.innerHTML = `<span class="badge superseded">${v.status}</span> `
+      + "引用已失效版本将被拒绝（seal_version_stale）";
+  } else if (v.pending_count > 0) {
+    box.innerHTML = `<span class="badge pending">待复核 ${v.pending_count}</span> `
+      + "复核未全部完成，封存将被拒绝（seal_review_incomplete）";
+  } else {
+    box.innerHTML = `<span class="badge accepted">active</span> `
+      + `复核已全部完成（共 ${v.finding_count} 项），可以封存`;
+  }
+}
+
+$("#seal-version").addEventListener("change", renderSealStatus);
+
+$("#create-seal").addEventListener("click", async () => {
+  const versionId = $("#seal-version").value;
+  if (!versionId) return alert("没有可封存的版本");
+  const keyBox = $("#seal-key-box");
+  try {
+    const r = await api("POST", "/api/seals", {
+      device_id: state.deviceId, version_id: versionId,
+    });
+    state.lastSeal = r;
+    keyBox.className = "notice ok";
+    keyBox.textContent =
+      `封存成功：${r.seal_id}\n`
+      + `一次性密钥（仅显示这一次，请立即转交离线核对人员）：\n${r.seal_key}\n`
+      + `封存包指纹：${r.package_sha256}`;
+    $("#seal-output").classList.remove("hidden");
+    $("#seal-output").textContent = JSON.stringify(r.package, null, 2);
+    $("#download-seal").classList.remove("hidden");
+    $("#copy-seal-cmd").classList.remove("hidden");
+    const cmd = `python3 sealcli.py verify ${r.seal_id}.json`
+      + ` --device ${state.deviceId} --key ${r.seal_key}`;
+    const cmdBox = $("#seal-cmd-box");
+    cmdBox.classList.remove("hidden");
+    cmdBox.textContent = cmd;
+    state.lastSealCmd = cmd;
+    loadSealView();
+  } catch (e) {
+    keyBox.className = "notice bad";
+    keyBox.textContent = `封存被拒绝：${e.code || ""} ${e.message}`;
+  }
+});
+
+$("#download-seal").addEventListener("click", () => {
+  if (!state.lastSeal) return;
+  const blob = new Blob([JSON.stringify(state.lastSeal.package, null, 2)],
+                        { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `${state.lastSeal.seal_id}.json`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+});
+
+$("#copy-seal-cmd").addEventListener("click", async () => {
+  if (!state.lastSealCmd) return;
+  try {
+    await navigator.clipboard.writeText(state.lastSealCmd);
+  } catch {
+    const box = $("#seal-cmd-box");
+    box.textContent = state.lastSealCmd + "\n（浏览器未授权剪贴板，请手动复制）";
   }
 });
 
